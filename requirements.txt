@@ -1,0 +1,6 @@
+aiogram>=3.4
+google-genai>=1.0
+motor>=3.3
+pydantic>=2.0
+apscheduler>=3.10
+python-dotenv>=1.0
