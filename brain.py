@@ -30,16 +30,16 @@ async def generate_response(user_id: int, text: str) -> str:
 
     contents = []
     if summary:
-        contents.append(types.Content(role="user", parts=[types.Part.from_text(
-            f"[Из наших прошлых разговоров ты помнишь: {summary}]"
+        contents.append(types.Content(role="user", parts=[types.Part(
+            text=f"[Из наших прошлых разговоров ты помнишь: {summary}]"
         )]))
-        contents.append(types.Content(role="model", parts=[types.Part.from_text(
-            "Помню! Продолжаем 🐮"
+        contents.append(types.Content(role="model", parts=[types.Part(
+            text="Помню! Продолжаем 🐮"
         )]))
 
     for msg in recent:
         role = "user" if msg["role"] == "user" else "model"
-        contents.append(types.Content(role=role, parts=[types.Part.from_text(msg["text"])]))
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg["text"])]))
 
     now = datetime.now(MSK)
     time_str = f"Сейчас {now.strftime('%H:%M')}, {now.strftime('%d.%m.%Y')}"
