@@ -7,12 +7,13 @@ from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatAction, BufferedInputFile,
+    BufferedInputFile,
 )
+from aiogram.enums import ChatAction
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, MSK
+from config import TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, CHILD_USER_ID, MSK
 import brain
 import memory
 
@@ -43,9 +44,14 @@ async def _typing(message: Message):
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await _typing(message)
+    user_id = message.from_user.id
+    if user_id == CHILD_USER_ID:
+        name = "Злата"
+    else:
+        name = message.from_user.first_name or "друг"
     await message.answer(
-        "Привет! Я Коровик 🐮\n\n"
-        "Спрашивай что хочешь — помогу придумать, объясню, расскажу историю "
+        f"Муу! Привет, {name}! Я Коровик — маленький телёнок с Облачной фермы 🐮\n\n"
+        "Спрашивай что хочешь — могу придумать идею, рассказать историю "
         "или просто поболтаем! Можешь писать текстом или отправить голосовое 🎤",
         reply_markup=_tts_kb(),
     )
@@ -59,6 +65,7 @@ async def handle_text(message: Message):
     text = message.text or ""
 
     if text.strip().lower() == "##сброс" and user_id == ADMIN_USER_ID:
+        await memory.delete_user_data(CHILD_USER_ID)
         await memory.delete_user_data(user_id)
         await message.answer("Данные сброшены 🔄")
         return

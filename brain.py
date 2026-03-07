@@ -41,11 +41,15 @@ async def generate_response(user_id: int, text: str) -> str:
         role = "user" if msg["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part.from_text(msg["text"])]))
 
+    now = datetime.now(MSK)
+    time_str = f"Сейчас {now.strftime('%H:%M')}, {now.strftime('%d.%m.%Y')}"
+    prompt = SYSTEM_PROMPT.format(current_time=time_str)
+
     resp = await ai.aio.models.generate_content(
         model=MODEL_CHAT,
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=prompt,
             temperature=0.85,
             max_output_tokens=1024,
         ),
