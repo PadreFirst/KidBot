@@ -113,11 +113,23 @@ async def analyze_image(user_id: int, image_bytes: bytes, mime_type: str, captio
 
 # ── image generation ───────────────────────────────────────────────
 
-async def generate_image(user_id: int, text: str) -> tuple[str, bytes | None, str | None]:
-    """Generate an image. Returns (text_answer, image_bytes_or_None, mime_type_or_None)."""
-    total = await memory.save_message(user_id, "user", text)
+async def generate_image(
+    user_id: int,
+    text: str,
+    ref_image: bytes | None = None,
+    ref_mime: str = "image/jpeg",
+) -> tuple[str, bytes | None, str | None]:
+    """Generate an image, optionally from a reference photo. Returns (text, image_bytes, mime)."""
+    total = await memory.save_message(user_id, "user", text or "[прислала фото с просьбой нарисовать]")
 
     contents = await _build_context(user_id)
+
+    if ref_image:
+        ref_parts = [
+            types.Part.from_bytes(data=ref_image, mime_type=ref_mime),
+            types.Part(text=text or "Нарисуй это"),
+        ]
+        contents.append(types.Content(role="user", parts=ref_parts))
 
     try:
         resp = await ai.aio.models.generate_content(

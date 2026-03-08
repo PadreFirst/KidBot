@@ -108,8 +108,19 @@ async def handle_photo(message: Message):
         return
 
     caption = message.caption or ""
-    answer = await brain.analyze_image(user_id, image_bytes, "image/jpeg", caption)
-    await message.answer(answer, reply_markup=_tts_kb())
+
+    if brain._wants_image(caption):
+        answer, img_bytes, mime = await brain.generate_image(
+            user_id, caption, ref_image=image_bytes, ref_mime="image/jpeg",
+        )
+        if img_bytes:
+            gen_photo = BufferedInputFile(img_bytes, filename="image.png")
+            await message.answer_photo(gen_photo, caption=answer[:1024] if answer else None)
+        else:
+            await message.answer(answer, reply_markup=_tts_kb())
+    else:
+        answer = await brain.analyze_image(user_id, image_bytes, "image/jpeg", caption)
+        await message.answer(answer, reply_markup=_tts_kb())
 
 
 # ── voice messages ──────────────────────────────────────────────────
