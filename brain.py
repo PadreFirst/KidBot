@@ -8,9 +8,10 @@ from google import genai
 from google.genai import types
 
 from config import (
-    GEMINI_API_KEY, MODEL_CHAT, MODEL_SERVICE, MODEL_TTS, TTS_VOICE,
-    SYSTEM_PROMPT, SUMMARIZE_PROMPT, REPORT_PROMPT,
-    COMPLAINT_KEYWORDS, WINDOW_SIZE, SUMMARIZE_THRESHOLD, MSK,
+    GEMINI_API_KEY, MODEL_CHAT, MODEL_SERVICE, MODEL_TTS, MODEL_IMAGE,
+    TTS_VOICE, SYSTEM_PROMPT, SUMMARIZE_PROMPT, REPORT_PROMPT,
+    COMPLAINT_KEYWORDS, IMAGE_GEN_TRIGGERS,
+    WINDOW_SIZE, SUMMARIZE_THRESHOLD, MSK,
 )
 import memory
 
@@ -19,12 +20,15 @@ log = logging.getLogger(__name__)
 ai = genai.Client(api_key=GEMINI_API_KEY)
 
 
-# ── chat ────────────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────────────
 
-async def generate_response(user_id: int, text: str) -> str:
-    """Full pipeline: save user msg, build context, generate, save assistant msg, background tasks."""
-    total = await memory.save_message(user_id, "user", text)
+def _build_system_prompt() -> str:
+    now = datetime.now(MSK)
+    time_str = f"Сейчас {now.strftime('%H:%M')}, {now.strftime('%d.%m.%Y')}"
+    return SYSTEM_PROMPT.format(current_time=time_str)
 
+
+async def _build_context(user_id: int) -> list:
     summary = await memory.get_summary(user_id)
     recent = await memory.get_recent_messages(user_id, WINDOW_SIZE)
 
@@ -41,26 +45,116 @@ async def generate_response(user_id: int, text: str) -> str:
         role = "user" if msg["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part(text=msg["text"])]))
 
-    now = datetime.now(MSK)
-    time_str = f"Сейчас {now.strftime('%H:%M')}, {now.strftime('%d.%m.%Y')}"
-    prompt = SYSTEM_PROMPT.format(current_time=time_str)
+    return contents
+
+
+def _wants_image(text: str) -> bool:
+    lower = text.lower()
+    return any(t in lower for t in IMAGE_GEN_TRIGGERS)
+
+
+# ── chat ────────────────────────────────────────────────────────────
+
+async def generate_response(user_id: int, text: str) -> str:
+    """Full pipeline: save user msg, build context, generate, save assistant msg, background tasks."""
+    total = await memory.save_message(user_id, "user", text)
+
+    contents = await _build_context(user_id)
 
     resp = await ai.aio.models.generate_content(
         model=MODEL_CHAT,
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=prompt,
+            system_instruction=_build_system_prompt(),
             temperature=0.85,
             max_output_tokens=1024,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
         ),
     )
     answer = (resp.text or "").strip() or "Ой, что-то я завис 🐮 Попробуй ещё раз!"
 
     await memory.save_message(user_id, "assistant", answer)
-
     asyncio.create_task(_maybe_summarize(user_id, total + 1))
 
     return answer
+
+
+# ── vision (photo analysis) ────────────────────────────────────────
+
+async def analyze_image(user_id: int, image_bytes: bytes, mime_type: str, caption: str = "") -> str:
+    """Analyze a photo sent by the user."""
+    total = await memory.save_message(user_id, "user", caption or "[прислала фото]")
+
+    contents = await _build_context(user_id)
+
+    user_parts = [types.Part.from_bytes(data=image_bytes, mime_type=mime_type)]
+    if caption:
+        user_parts.append(types.Part(text=caption))
+    else:
+        user_parts.append(types.Part(text="Что ты видишь на этом фото?"))
+    contents.append(types.Content(role="user", parts=user_parts))
+
+    resp = await ai.aio.models.generate_content(
+        model=MODEL_CHAT,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=_build_system_prompt(),
+            temperature=0.85,
+            max_output_tokens=1024,
+        ),
+    )
+    answer = (resp.text or "").strip() or "Ой, не могу разглядеть 🐮 Попробуй другое фото!"
+
+    await memory.save_message(user_id, "assistant", answer)
+    asyncio.create_task(_maybe_summarize(user_id, total + 1))
+
+    return answer
+
+
+# ── image generation ───────────────────────────────────────────────
+
+async def generate_image(user_id: int, text: str) -> tuple[str, bytes | None, str | None]:
+    """Generate an image. Returns (text_answer, image_bytes_or_None, mime_type_or_None)."""
+    total = await memory.save_message(user_id, "user", text)
+
+    contents = await _build_context(user_id)
+
+    try:
+        resp = await ai.aio.models.generate_content(
+            model=MODEL_IMAGE,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+                temperature=0.85,
+                max_output_tokens=1024,
+            ),
+        )
+
+        result_text = ""
+        result_image = None
+        result_mime = None
+
+        if resp.candidates and resp.candidates[0].content:
+            for part in resp.candidates[0].content.parts:
+                if part.text:
+                    result_text += part.text
+                elif part.inline_data and part.inline_data.data:
+                    result_image = part.inline_data.data
+                    result_mime = part.inline_data.mime_type or "image/png"
+
+        if not result_text:
+            result_text = "Вот что получилось! 🎨"
+
+        await memory.save_message(user_id, "assistant", result_text)
+        asyncio.create_task(_maybe_summarize(user_id, total + 1))
+
+        return result_text, result_image, result_mime
+
+    except Exception:
+        log.exception("Image generation failed")
+        fallback = "Ой, не получилось нарисовать 😕 Попробуй описать по-другому!"
+        await memory.save_message(user_id, "assistant", fallback)
+        return fallback, None, None
 
 
 async def _maybe_summarize(user_id: int, total: int):

@@ -7,9 +7,9 @@ from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    BufferedInputFile,
+    BufferedInputFile, InputMediaPhoto,
 )
-from aiogram.enums import ChatAction
+from aiogram.enums import ChatAction, ContentType
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -75,11 +75,41 @@ async def handle_text(message: Message):
     prev_msgs = await memory.get_recent_messages(user_id, 1)
     prev_bot_msg = prev_msgs[-1]["text"] if prev_msgs and prev_msgs[-1]["role"] == "assistant" else ""
 
-    answer = await brain.generate_response(user_id, text)
-    await message.answer(answer, reply_markup=_tts_kb())
+    if brain._wants_image(text):
+        answer, img_bytes, mime = await brain.generate_image(user_id, text)
+        if img_bytes:
+            photo = BufferedInputFile(img_bytes, filename="image.png")
+            await message.answer_photo(photo, caption=answer[:1024] if answer else None)
+        else:
+            await message.answer(answer, reply_markup=_tts_kb())
+    else:
+        answer = await brain.generate_response(user_id, text)
+        await message.answer(answer, reply_markup=_tts_kb())
 
     if brain.is_complaint(text):
         asyncio.create_task(brain.log_complaint(user_id, text, prev_bot_msg))
+
+
+# ── photo messages ─────────────────────────────────────────────────
+
+@router.message(F.photo)
+async def handle_photo(message: Message):
+    user_id = message.from_user.id
+    await _typing(message)
+
+    try:
+        photo = message.photo[-1]
+        file = await message.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await message.bot.download_file(file.file_path, buf)
+        image_bytes = buf.getvalue()
+    except Exception:
+        await message.answer("Не получилось загрузить фото 😕 Попробуй ещё раз!", reply_markup=_tts_kb())
+        return
+
+    caption = message.caption or ""
+    answer = await brain.analyze_image(user_id, image_bytes, "image/jpeg", caption)
+    await message.answer(answer, reply_markup=_tts_kb())
 
 
 # ── voice messages ──────────────────────────────────────────────────
@@ -110,8 +140,16 @@ async def handle_voice(message: Message):
     prev_msgs = await memory.get_recent_messages(user_id, 1)
     prev_bot_msg = prev_msgs[-1]["text"] if prev_msgs and prev_msgs[-1]["role"] == "assistant" else ""
 
-    answer = await brain.generate_response(user_id, text)
-    await message.answer(answer, reply_markup=_tts_kb())
+    if brain._wants_image(text):
+        answer, img_bytes, mime = await brain.generate_image(user_id, text)
+        if img_bytes:
+            photo = BufferedInputFile(img_bytes, filename="image.png")
+            await message.answer_photo(photo, caption=answer[:1024] if answer else None)
+        else:
+            await message.answer(answer, reply_markup=_tts_kb())
+    else:
+        answer = await brain.generate_response(user_id, text)
+        await message.answer(answer, reply_markup=_tts_kb())
 
     if brain.is_complaint(text):
         asyncio.create_task(brain.log_complaint(user_id, text, prev_bot_msg))
