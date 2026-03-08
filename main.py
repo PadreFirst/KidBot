@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import time as _time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
@@ -25,6 +26,72 @@ _bot: Bot | None = None
 
 TG_TEXT_LIMIT = 4096
 TG_CAPTION_LIMIT = 1024
+PHOTO_DEBOUNCE_SEC = 3.5
+
+
+# ── pending photo buffer ───────────────────────────────────────────
+
+class _PendingPhoto:
+    __slots__ = ("image_bytes", "caption", "message", "timer", "ts")
+
+    def __init__(self, image_bytes: bytes, caption: str, message: Message):
+        self.image_bytes = image_bytes
+        self.caption = caption
+        self.message = message
+        self.timer: asyncio.Task | None = None
+        self.ts = _time.monotonic()
+
+
+_pending: dict[int, _PendingPhoto] = {}
+
+
+async def _flush_photo(user_id: int):
+    """Called after debounce timeout — process the photo alone."""
+    pp = _pending.pop(user_id, None)
+    if not pp:
+        return
+    await _process_photo_with_text(pp, extra_text=None, voice_bytes=None, reply_msg=pp.message)
+
+
+async def _process_photo_with_text(
+    pp: _PendingPhoto,
+    extra_text: str | None,
+    voice_bytes: bytes | None,
+    reply_msg: Message,
+):
+    """Unified handler: photo + optional text/voice."""
+    user_id = reply_msg.from_user.id
+    await _typing(reply_msg)
+
+    caption = pp.caption
+    voice_text = ""
+
+    if voice_bytes:
+        voice_text = await brain.transcribe_voice(voice_bytes)
+        if voice_text:
+            extra_text = f"[голосовое сообщение] {voice_text}"
+
+    combined_text = " ".join(filter(None, [caption, extra_text or voice_text])).strip()
+
+    if brain._wants_image(combined_text):
+        answer, img_bytes, mime = await brain.generate_image(
+            user_id, combined_text, ref_image=pp.image_bytes, ref_mime="image/jpeg",
+        )
+        if img_bytes:
+            photo = BufferedInputFile(img_bytes, filename="image.png")
+            await reply_msg.answer_photo(photo, caption=(answer or "")[:TG_CAPTION_LIMIT] or None)
+        else:
+            await _safe_answer(reply_msg, answer, reply_markup=_tts_kb())
+    else:
+        answer = await brain.analyze_image(
+            user_id, pp.image_bytes, "image/jpeg", combined_text,
+        )
+        await _safe_answer(reply_msg, answer, reply_markup=_tts_kb())
+
+    if combined_text and brain.is_complaint(combined_text):
+        prev_msgs = await memory.get_recent_messages(user_id, 1)
+        prev_bot = prev_msgs[-1]["text"] if prev_msgs and prev_msgs[-1]["role"] == "assistant" else ""
+        asyncio.create_task(brain.log_complaint(user_id, combined_text, prev_bot))
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -43,7 +110,6 @@ async def _typing(message: Message):
 
 
 async def _safe_answer(message: Message, text: str, **kwargs):
-    """Send text, truncating if it exceeds Telegram limit."""
     if len(text) > TG_TEXT_LIMIT:
         text = text[:TG_TEXT_LIMIT - 20] + "\n\n(продолжение...)"
     await message.answer(text, **kwargs)
@@ -80,6 +146,13 @@ async def handle_text(message: Message):
         await message.answer("Данные сброшены 🔄")
         return
 
+    pp = _pending.pop(user_id, None)
+    if pp:
+        if pp.timer:
+            pp.timer.cancel()
+        await _process_photo_with_text(pp, extra_text=text, voice_bytes=None, reply_msg=message)
+        return
+
     await _typing(message)
 
     prev_msgs = await memory.get_recent_messages(user_id, 1)
@@ -105,7 +178,6 @@ async def handle_text(message: Message):
 @router.message(F.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
-    await _typing(message)
 
     try:
         photo = message.photo[-1]
@@ -119,18 +191,35 @@ async def handle_photo(message: Message):
 
     caption = message.caption or ""
 
-    if brain._wants_image(caption):
-        answer, img_bytes, mime = await brain.generate_image(
-            user_id, caption, ref_image=image_bytes, ref_mime="image/jpeg",
-        )
-        if img_bytes:
-            gen_photo = BufferedInputFile(img_bytes, filename="image.png")
-            await message.answer_photo(gen_photo, caption=(answer or "")[:TG_CAPTION_LIMIT] or None)
+    if caption and (brain._wants_image(caption) or len(caption) > 20):
+        await _typing(message)
+        if brain._wants_image(caption):
+            answer, img_bytes, mime = await brain.generate_image(
+                user_id, caption, ref_image=image_bytes, ref_mime="image/jpeg",
+            )
+            if img_bytes:
+                gen_photo = BufferedInputFile(img_bytes, filename="image.png")
+                await message.answer_photo(gen_photo, caption=(answer or "")[:TG_CAPTION_LIMIT] or None)
+            else:
+                await _safe_answer(message, answer, reply_markup=_tts_kb())
         else:
+            answer = await brain.analyze_image(user_id, image_bytes, "image/jpeg", caption)
             await _safe_answer(message, answer, reply_markup=_tts_kb())
-    else:
-        answer = await brain.analyze_image(user_id, image_bytes, "image/jpeg", caption)
-        await _safe_answer(message, answer, reply_markup=_tts_kb())
+        return
+
+    old = _pending.pop(user_id, None)
+    if old and old.timer:
+        old.timer.cancel()
+
+    pp = _PendingPhoto(image_bytes, caption, message)
+    _pending[user_id] = pp
+    await _typing(message)
+
+    async def _debounce_fire():
+        await asyncio.sleep(PHOTO_DEBOUNCE_SEC)
+        await _flush_photo(user_id)
+
+    pp.timer = asyncio.create_task(_debounce_fire())
 
 
 # ── voice messages ──────────────────────────────────────────────────
@@ -148,6 +237,13 @@ async def handle_voice(message: Message):
         audio_bytes = buf.getvalue()
     except Exception:
         await message.answer("Не получилось скачать голосовое 😕 Попробуй ещё раз!", reply_markup=_tts_kb())
+        return
+
+    pp = _pending.pop(user_id, None)
+    if pp:
+        if pp.timer:
+            pp.timer.cancel()
+        await _process_photo_with_text(pp, extra_text=None, voice_bytes=audio_bytes, reply_msg=message)
         return
 
     text = await brain.transcribe_voice(audio_bytes)
