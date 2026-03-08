@@ -308,15 +308,20 @@ async def _pcm_to_ogg(pcm_data: bytes, sample_rate: int = 24000) -> bytes | None
 
 # ── voice transcription ────────────────────────────────────────────
 
-async def transcribe_voice(audio_bytes: bytes) -> str:
-    try:
-        part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
-        resp = await ai.aio.models.generate_content(
-            model=MODEL_SERVICE,
-            contents=[part, "Транскрибируй аудио. Верни ТОЛЬКО текст, без пояснений."],
-            config=types.GenerateContentConfig(temperature=0.1),
-        )
-        return (resp.text or "").strip()
-    except Exception:
-        log.exception("Voice transcription failed")
-        return ""
+async def transcribe_voice(audio_bytes: bytes, retries: int = 2) -> str:
+    part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
+    for attempt in range(retries):
+        try:
+            resp = await ai.aio.models.generate_content(
+                model=MODEL_SERVICE,
+                contents=[part, "Транскрибируй аудио на русском. Верни ТОЛЬКО текст, без пояснений."],
+                config=types.GenerateContentConfig(temperature=0.1),
+            )
+            result = (resp.text or "").strip()
+            if result:
+                return result
+        except Exception:
+            log.exception("Voice transcription attempt %d failed", attempt + 1)
+            if attempt < retries - 1:
+                await asyncio.sleep(1.5)
+    return ""

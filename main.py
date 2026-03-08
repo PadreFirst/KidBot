@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 router = Router()
 _bot: Bot | None = None
 
+TG_TEXT_LIMIT = 4096
+TG_CAPTION_LIMIT = 1024
+
 
 # ── helpers ─────────────────────────────────────────────────────────
 
@@ -37,6 +40,13 @@ async def _typing(message: Message):
         await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
     except Exception:
         pass
+
+
+async def _safe_answer(message: Message, text: str, **kwargs):
+    """Send text, truncating if it exceeds Telegram limit."""
+    if len(text) > TG_TEXT_LIMIT:
+        text = text[:TG_TEXT_LIMIT - 20] + "\n\n(продолжение...)"
+    await message.answer(text, **kwargs)
 
 
 # ── /start ──────────────────────────────────────────────────────────
@@ -79,12 +89,12 @@ async def handle_text(message: Message):
         answer, img_bytes, mime = await brain.generate_image(user_id, text)
         if img_bytes:
             photo = BufferedInputFile(img_bytes, filename="image.png")
-            await message.answer_photo(photo, caption=answer[:1024] if answer else None)
+            await message.answer_photo(photo, caption=(answer or "")[:TG_CAPTION_LIMIT] or None)
         else:
-            await message.answer(answer, reply_markup=_tts_kb())
+            await _safe_answer(message, answer, reply_markup=_tts_kb())
     else:
         answer = await brain.generate_response(user_id, text)
-        await message.answer(answer, reply_markup=_tts_kb())
+        await _safe_answer(message, answer, reply_markup=_tts_kb())
 
     if brain.is_complaint(text):
         asyncio.create_task(brain.log_complaint(user_id, text, prev_bot_msg))
@@ -115,12 +125,12 @@ async def handle_photo(message: Message):
         )
         if img_bytes:
             gen_photo = BufferedInputFile(img_bytes, filename="image.png")
-            await message.answer_photo(gen_photo, caption=answer[:1024] if answer else None)
+            await message.answer_photo(gen_photo, caption=(answer or "")[:TG_CAPTION_LIMIT] or None)
         else:
-            await message.answer(answer, reply_markup=_tts_kb())
+            await _safe_answer(message, answer, reply_markup=_tts_kb())
     else:
         answer = await brain.analyze_image(user_id, image_bytes, "image/jpeg", caption)
-        await message.answer(answer, reply_markup=_tts_kb())
+        await _safe_answer(message, answer, reply_markup=_tts_kb())
 
 
 # ── voice messages ──────────────────────────────────────────────────
@@ -142,25 +152,24 @@ async def handle_voice(message: Message):
 
     text = await brain.transcribe_voice(audio_bytes)
     if not text:
-        await message.answer("Не удалось распознать 😕 Попробуй написать текстом!", reply_markup=_tts_kb())
+        await message.answer("Не удалось распознать 😕 Попробуй ещё раз или напиши текстом!", reply_markup=_tts_kb())
         return
-
-    await message.answer(f"🎤 Услышал: «{text}»")
-    await _typing(message)
 
     prev_msgs = await memory.get_recent_messages(user_id, 1)
     prev_bot_msg = prev_msgs[-1]["text"] if prev_msgs and prev_msgs[-1]["role"] == "assistant" else ""
+
+    voice_text = f"[голосовое сообщение] {text}"
 
     if brain._wants_image(text):
         answer, img_bytes, mime = await brain.generate_image(user_id, text)
         if img_bytes:
             photo = BufferedInputFile(img_bytes, filename="image.png")
-            await message.answer_photo(photo, caption=answer[:1024] if answer else None)
+            await message.answer_photo(photo, caption=(answer or "")[:TG_CAPTION_LIMIT] or None)
         else:
-            await message.answer(answer, reply_markup=_tts_kb())
+            await _safe_answer(message, answer, reply_markup=_tts_kb())
     else:
-        answer = await brain.generate_response(user_id, text)
-        await message.answer(answer, reply_markup=_tts_kb())
+        answer = await brain.generate_response(user_id, voice_text)
+        await _safe_answer(message, answer, reply_markup=_tts_kb())
 
     if brain.is_complaint(text):
         asyncio.create_task(brain.log_complaint(user_id, text, prev_bot_msg))
@@ -200,7 +209,7 @@ async def _send_daily_report():
     try:
         report = await brain.generate_daily_report()
         if report:
-            await _bot.send_message(ADMIN_USER_ID, report)
+            await _bot.send_message(ADMIN_USER_ID, report[:TG_TEXT_LIMIT])
             await memory.clear_today_complaints()
             log.info("Daily report sent to admin")
     except Exception:
