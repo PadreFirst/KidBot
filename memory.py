@@ -1,9 +1,10 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from config import MONGODB_URI, MONGODB_DB_NAME, WINDOW_SIZE, SUMMARIZE_THRESHOLD, MSK
+from config import MONGODB_URI, MONGODB_DB_NAME, WINDOW_SIZE, MSK
 
 _client: AsyncIOMotorClient | None = None
+_indexes_ready = False
 
 
 def _db():
@@ -11,6 +12,19 @@ def _db():
     if _client is None:
         _client = AsyncIOMotorClient(MONGODB_URI)
     return _client[MONGODB_DB_NAME]
+
+
+async def ensure_indexes():
+    """Create indexes once at startup — history queries hit these on every message."""
+    global _indexes_ready
+    if _indexes_ready:
+        return
+    db = _db()
+    await db["messages"].create_index([("user_id", 1), ("ts", -1)])
+    await db["complaints"].create_index([("ts", 1)])
+    await db["profiles"].create_index("user_id", unique=True)
+    await db["ideas"].create_index([("user_id", 1), ("ts", -1)])
+    _indexes_ready = True
 
 
 # ── messages ────────────────────────────────────────────────────────
@@ -69,6 +83,64 @@ async def upsert_summary(user_id: int, summary: str):
     )
 
 
+# ── profile (likes / dislikes / projects) ───────────────────────────
+
+EMPTY_PROFILE = {
+    "likes": [],
+    "dislikes": [],
+    "projects": [],
+    "people": [],
+    "style": [],
+}
+
+
+async def get_profile(user_id: int) -> dict:
+    doc = await _db()["profiles"].find_one({"user_id": user_id}, {"_id": 0, "user_id": 0})
+    if not doc:
+        return dict(EMPTY_PROFILE)
+    profile = dict(EMPTY_PROFILE)
+    for key in EMPTY_PROFILE:
+        val = doc.get(key)
+        if isinstance(val, list):
+            profile[key] = [str(v) for v in val if v]
+    return profile
+
+
+async def upsert_profile(user_id: int, profile: dict):
+    clean = {k: [str(v) for v in profile.get(k, []) if v][:8] for k in EMPTY_PROFILE}
+    clean["updated_at"] = datetime.now(timezone.utc)
+    await _db()["profiles"].update_one(
+        {"user_id": user_id}, {"$set": clean}, upsert=True,
+    )
+
+
+# ── idea ledger (anti-repeat) ───────────────────────────────────────
+
+async def save_ideas(user_id: int, titles: list[str]):
+    if not titles:
+        return
+    now = datetime.now(timezone.utc)
+    await _db()["ideas"].insert_many([
+        {"user_id": user_id, "title": t.strip()[:120], "ts": now}
+        for t in titles if t.strip()
+    ])
+
+
+async def get_recent_ideas(user_id: int, limit: int = 40) -> list[str]:
+    cursor = _db()["ideas"].find(
+        {"user_id": user_id}, {"_id": 0, "title": 1},
+    ).sort("ts", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    seen, out = set(), []
+    for d in docs:
+        t = d.get("title", "").strip()
+        low = t.lower()
+        if t and low not in seen:
+            seen.add(low)
+            out.append(t)
+    return out
+
+
 # ── complaints ──────────────────────────────────────────────────────
 
 async def save_complaint(user_id: int, user_msg: str, bot_msg: str):
@@ -80,23 +152,23 @@ async def save_complaint(user_id: int, user_msg: str, bot_msg: str):
     })
 
 
-async def get_today_complaints() -> list[dict]:
+def _start_of_day_utc() -> datetime:
     now = datetime.now(MSK)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = start_of_day - timedelta(hours=3)
+    return start_of_day.astimezone(timezone.utc)
+
+
+async def get_today_complaints() -> list[dict]:
     col = _db()["complaints"]
     cursor = col.find(
-        {"ts": {"$gte": start_utc}},
+        {"ts": {"$gte": _start_of_day_utc()}},
         {"_id": 0, "user_message": 1, "bot_message": 1, "ts": 1},
     ).sort("ts", 1)
     return await cursor.to_list(length=200)
 
 
 async def clear_today_complaints():
-    now = datetime.now(MSK)
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = start_of_day - timedelta(hours=3)
-    await _db()["complaints"].delete_many({"ts": {"$gte": start_utc}})
+    await _db()["complaints"].delete_many({"ts": {"$gte": _start_of_day_utc()}})
 
 
 # ── full reset (admin) ──────────────────────────────────────────────
@@ -106,3 +178,5 @@ async def delete_user_data(user_id: int):
     await db["messages"].delete_many({"user_id": user_id})
     await db["summaries"].delete_many({"user_id": user_id})
     await db["complaints"].delete_many({"user_id": user_id})
+    await db["profiles"].delete_many({"user_id": user_id})
+    await db["ideas"].delete_many({"user_id": user_id})
